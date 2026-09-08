@@ -187,6 +187,7 @@ spec:
               name: kerberos-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
+              readOnly: true
             - mountPath: /dev
               name: device-dir
             - mountPath: /run/kata-containers/shared/direct-volumes

@@ -278,6 +278,7 @@ spec:
               name: kerberos-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
+              readOnly: true
             - mountPath: /dev
               name: device-dir
             {{- if eq .Values.linux.distro "fedora" }}

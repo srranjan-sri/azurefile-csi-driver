@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/azurefile-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileservicepropertiesclient/mock_fileservicepropertiesclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient/mock_fileshareclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
@@ -1405,6 +1406,205 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 		ginkgo.When("encryptInTransit is invalid", func() {
 			ginkgo.It("should fail", func(ctx context.Context) {
 				commonTests(ctx, "invalid", false)
+			})
+		})
+
+		// NFS + encryptInTransit exercises the new AccountOptions wiring
+		// (IsNFSEncryptionInTransitEnabled + SkipHTTPSTrafficOnlyMatch) added
+		// in this PR. Beyond parsing, these cases assert that:
+		//   - the NFS branch succeeds for both encryptInTransit values, and
+		//   - EnableHTTPSTrafficOnly on the created account tracks the
+		//     encryptInTransit request: true when EiT=true (client-side TLS
+		//     via aznfs), and false when EiT=false so plaintext Azure Files
+		//     NFS mounts are not rejected by the server.
+		nfsEncryptInTransitTest := func(ctx context.Context, encryptInTransit string, preExistingHTTPSOnAccount bool, expectCreate bool) {
+			SKU := "Premium_LRS"
+			kind := "FileStorage"
+			location := "centralus"
+			value := "foo bar"
+			// Optionally seed one pre-existing NFS account with
+			// EnableHTTPSTrafficOnly=true and a matching VNet allow-rule so
+			// we can prove:
+			//   - plaintext NFS refuses to reuse it (HTTPS-only mismatch)
+			//     and calls Create,
+			//   - EiT NFS is allowed to reuse it (SkipHTTPSTrafficOnlyMatch)
+			//     and skips Create.
+			// The subnet resource ID that updateSubnetServiceEndpoints will
+			// produce for vnet-rg/nfs-vnet/nfs-subnet (SubscriptionID is
+			// empty in this test config).
+			subnetResourceID := "/subscriptions//resourceGroups/vnet-rg/providers/Microsoft.Network/virtualNetworks/nfs-vnet/subnets/nfs-subnet"
+			var accounts []*armstorage.Account
+			if preExistingHTTPSOnAccount {
+				accounts = []*armstorage.Account{
+					{
+						Name:     ptr.To("preexistingnfs"),
+						Location: &location,
+						SKU:      &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))},
+						Kind:     to.Ptr(armstorage.Kind(kind)),
+						Properties: &armstorage.AccountProperties{
+							EnableHTTPSTrafficOnly: ptr.To(true),
+							// AccountOptions in this path defaults
+							// AllowBlobPublicAccess=false; the reuse matcher
+							// treats a missing value as true and would
+							// therefore reject reuse before the HTTPS-only
+							// check is exercised, so pin it explicitly.
+							AllowBlobPublicAccess: ptr.To(false),
+							ProvisioningState:     to.Ptr(armstorage.ProvisioningStateSucceeded),
+							NetworkRuleSet: &armstorage.NetworkRuleSet{
+								VirtualNetworkRules: []*armstorage.VirtualNetworkRule{
+									{
+										VirtualNetworkResourceID: ptr.To(subnetResourceID),
+										Action:                   to.Ptr(string(armstorage.DefaultActionAllow)),
+									},
+								},
+							},
+						},
+					},
+				}
+			} else {
+				// No pre-existing account listed; forces a Create so we can
+				// inspect AccountCreateParameters.
+				accounts = []*armstorage.Account{}
+			}
+			keys := []*armstorage.AccountKey{
+				{Value: &value},
+			}
+
+			allParam := map[string]string{
+				protocolField:          "nfs",
+				skuNameField:           SKU,
+				encryptInTransitField:  encryptInTransit,
+				vnetResourceGroupField: "vnet-rg",
+				vnetNameField:          "nfs-vnet",
+				subnetNameField:        "nfs-subnet",
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-nfs-eit-" + encryptInTransit,
+				VolumeCapabilities: stdVolCap,
+				CapacityRange:      lessThanPremCapRange,
+				Parameters:         allParam,
+			}
+
+			// Use a fakeCloud with a real Config so updateSubnetServiceEndpoints
+			// and EnsureStorageAccount proceed into the account-create branch.
+			var err error
+			d.cloud, err = storage.NewRepository(
+				config.Config{
+					ResourceGroup: "rg",
+					Location:      location,
+				},
+				&azclient.Environment{},
+				nil,
+				computeClientFactory,
+				networkClientFactory,
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			fakeCloud := d.cloud
+
+			// Mock the subnet client so updateSubnetServiceEndpoints succeeds.
+			mockSubnetClient := mock_subnetclient.NewMockInterface(ctrl)
+			fakeCloud.NetworkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			fakeCloud.NetworkClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+			mockSubnetClient.EXPECT().Get(gomock.Any(), "vnet-rg", "nfs-vnet", "nfs-subnet", gomock.Any()).Return(
+				&armnetwork.Subnet{
+					Name:       ptr.To("nfs-subnet"),
+					Properties: &armnetwork.SubnetPropertiesFormat{},
+				}, nil).AnyTimes()
+			mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), "vnet-rg", "nfs-vnet", "nfs-subnet", gomock.Any()).Return(nil, nil).AnyTimes()
+
+			// Mock the file service properties client so the NFS EiT branch
+			// in EnsureStorageAccount (which reads/writes account-level
+			// ProtocolSettings.Nfs.EncryptionInTransit) can run to completion
+			// instead of panicking on a nil client.
+			mockFilePropsClient := mock_fileservicepropertiesclient.NewMockInterface(ctrl)
+			computeClientFactory.EXPECT().GetFileServicePropertiesClient().Return(mockFilePropsClient).AnyTimes()
+			computeClientFactory.EXPECT().GetFileServicePropertiesClientForSub(gomock.Any()).Return(mockFilePropsClient, nil).AnyTimes()
+			mockFilePropsClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileServiceProperties{FileServiceProperties: &armstorage.FileServicePropertiesProperties{}}, nil).AnyTimes()
+			var capturedSetProps *armstorage.FileServiceProperties
+			mockFilePropsClient.EXPECT().Set(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, _, _ string, props armstorage.FileServiceProperties) (*armstorage.FileServiceProperties, error) {
+					capturedSetProps = &props
+					return &props, nil
+				}).AnyTimes()
+
+			mockStorageAccountsClient := d.cloud.ComputeClientFactory.GetAccountClient().(*mock_accountclient.MockInterface)
+
+			var capturedCreateParams *armstorage.AccountCreateParameters
+			mockFileClient.EXPECT().Create(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().List(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, _ string, accountName string, params *armstorage.AccountCreateParameters) (*armstorage.Account, error) {
+					capturedCreateParams = params
+					return &armstorage.Account{Name: &accountName, SKU: &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))}, Kind: to.Ptr(armstorage.Kind(kind)), Location: &location}, nil
+				}).AnyTimes()
+			mockFileClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+
+			_, err = d.CreateVolume(ctx, req)
+			// CreateVolume may still fail past this point due to unmocked
+			// dependencies (private DNS zone, file service properties, etc.),
+			// but by then the account Create call must already have been
+			// invoked in the create-branch cases -- assert on the captured
+			// params unconditionally so a regression that skips Create
+			// fails this test loudly.
+			if expectCreate {
+				gomega.Expect(capturedCreateParams).NotTo(gomega.BeNil(),
+					"account Create must be invoked so the NFS EiT wiring is exercised")
+				gomega.Expect(capturedCreateParams.Properties).NotTo(gomega.BeNil())
+				expectedHTTPSOnly := encryptInTransit == "true"
+				gomega.Expect(ptr.Deref(capturedCreateParams.Properties.EnableHTTPSTrafficOnly, false)).To(gomega.Equal(expectedHTTPSOnly),
+					"EnableHTTPSTrafficOnly on NFS accounts should track encryptInTransit (true→true, false→false)")
+			} else {
+				// Reuse branch: with EiT=true and a pre-existing HTTPS-on
+				// NFS account, SkipHTTPSTrafficOnlyMatch=true must let the
+				// existing account be reused, so no Create call happens.
+				gomega.Expect(capturedCreateParams).To(gomega.BeNil(),
+					"pre-existing HTTPS-on NFS account should be reused when encryptInTransit=true, no Create expected")
+			}
+			if encryptInTransit == "true" && expectCreate {
+				// Also assert the post-Create ProtocolSettings.Set call
+				// carried Nfs.EncryptionInTransit.Required=true; a
+				// regression that skips this update would leave the account
+				// without EiT enforcement. Note: this ProtocolSettings.Set
+				// only runs on the create-new-account path in
+				// EnsureStorageAccount, so we don't assert it in the reuse
+				// (expectCreate=false) branch.
+				gomega.Expect(capturedSetProps).NotTo(gomega.BeNil(),
+					"fileServiceProperties.Set must be called to stamp Nfs.EncryptionInTransit.Required=true")
+				gomega.Expect(capturedSetProps.FileServiceProperties).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs.EncryptionInTransit).NotTo(gomega.BeNil())
+				gomega.Expect(ptr.Deref(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs.EncryptionInTransit.Required, false)).To(gomega.BeTrue(),
+					"ProtocolSettings.Nfs.EncryptionInTransit.Required must be true for encryptInTransit=true")
+			}
+			if err != nil {
+				gomega.Expect(err).NotTo(gomega.MatchError(gomega.ContainSubstring(encryptInTransitField)))
+			}
+		}
+
+		ginkgo.When("protocol is nfs and encryptInTransit is true", func() {
+			ginkgo.It("should exercise the NFS EiT AccountOptions wiring", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "true", false, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is false", func() {
+			ginkgo.It("should exercise the NFS non-EiT AccountOptions wiring", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "false", false, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is false with a pre-existing HTTPS-on NFS account", func() {
+			ginkgo.It("must reject reuse of the HTTPS-on account and create a new HTTPS-off account", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "false", true, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is true with a pre-existing HTTPS-on NFS account", func() {
+			ginkgo.It("should reuse the HTTPS-on account and skip Create", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "true", true, false)
 			})
 		})
 
